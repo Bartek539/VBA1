@@ -1,0 +1,142 @@
+Option Explicit
+
+Sub PrzetworzDaneFinansowe()
+    ' --- DEKLARACJE ZMIENNYCH ---
+    Dim wsRun As Worksheet, wsIPR As Worksheet
+    Dim wbSource As Workbook
+    Dim filePath As String
+    Dim lastRow As Long, i As Long
+    
+    Dim colFund As Long, colPayee As Long, colCcy As Long, colAmt As Long
+    Dim rFound As Range
+    
+    Dim sumUSD As Double, sumEUR As Double, sumJPY As Double
+    Dim ccy As String
+    Dim amt As Double
+
+    ' --- OPTYMALIZACJA EXCELA (Przyspieszenie działania) ---
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.DisplayAlerts = False
+
+    ' --- OBSŁUGA BŁĘDÓW ---
+    On Error GoTo ErrorHandler
+
+    ' 1. Definicja arkusza głównego
+    Set wsRun = ThisWorkbook.Sheets("RUN")
+    
+    ' 2. Pobranie ścieżki do pliku z komórki B2
+    filePath = wsRun.Range("B2").Value
+    
+    ' Sprawdzenie czy ścieżka nie jest pusta
+    If filePath = "" Or Dir(filePath) = "" Then
+        MsgBox "Nie znaleziono pliku podaną ścieżką w komórce B2!", vbCritical, "Błąd pliku"
+        GoTo Cleanup
+    End If
+
+    ' 3. Otwarcie pliku źródłowego z hasłem
+    Set wbSource = Workbooks.Open(Filename:=filePath, Password:="ABC12345", ReadOnly:=True)
+
+    ' 4. Przygotowanie arkusza IPR w bieżącym pliku
+    ' Sprawdzenie czy arkusz IPR istnieje, jeśli tak - usunięcie go (aby mieć czystą kartę)
+    On Error Resume Next
+    Set wsIPR = ThisWorkbook.Sheets("IPR")
+    If Not wsIPR Is Nothing Then wsIPR.Delete
+    On Error GoTo ErrorHandler
+    
+    ' Utworzenie nowego arkusza IPR na końcu skoroszytu
+    Set wsIPR = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+    wsIPR.Name = "IPR"
+
+    ' 5. Skopiowanie wszystkich danych ze źródła do IPR i zamknięcie pliku źródłowego
+    wbSource.Sheets(1).UsedRange.Copy Destination:=wsIPR.Range("A1")
+    wbSource.Close SaveChanges:=False
+
+    ' 6. Usunięcie pierwszych 5 wierszy z arkusza IPR
+    wsIPR.Rows("1:5").Delete Shift:=xlUp
+
+    ' 7. Dynamiczne znalezienie numerów kolumn (zakładamy, że nagłówki są teraz w 1. wierszu)
+    colFund = ZnajdzKolumne(wsIPR, "Fund Code")
+    colPayee = ZnajdzKolumne(wsIPR, "Payee")
+    colCcy = ZnajdzKolumne(wsIPR, "Debit Ccy")
+    colAmt = ZnajdzKolumne(wsIPR, "Debit Ccy Amount")
+    
+    ' Jeśli brakuje jakiejś kolumny, funkcja pomocnicza wyrzuci błąd, który przechwyci ErrorHandler
+
+    ' 8. Usunięcie wierszy dla Fund Code 7588 i 7606 (Pętla od końca do początku!)
+    lastRow = wsIPR.Cells(wsIPR.Rows.Count, 1).End(xlUp).Row
+    For i = lastRow To 2 Step -1
+        If wsIPR.Cells(i, colFund).Value = "7588" Or wsIPR.Cells(i, colFund).Value = "7606" Then
+            wsIPR.Rows(i).Delete
+        End If
+    Next i
+
+    ' 9. Filtrowanie kolumny Payee po słowach BRIDGE oraz ROCK
+    ' Zaktualizowanie ostatniego wiersza po usunięciach
+    lastRow = wsIPR.Cells(wsIPR.Rows.Count, 1).End(xlUp).Row
+    wsIPR.UsedRange.AutoFilter Field:=colPayee, Criteria1:="=*BRIDGE*", Operator:=xlOr, Criteria2:="=*ROCK*"
+
+    ' 10. Sumowanie wartości z widocznych (przefiltrowanych) wierszy
+    sumUSD = 0: sumEUR = 0: sumJPY = 0
+    
+    For i = 2 To lastRow
+        ' Sprawdzenie czy wiersz JEST WIDOCZNY (czyli spełnia warunki filtra)
+        If Not wsIPR.Rows(i).Hidden Then
+            ccy = UCase(Trim(wsIPR.Cells(i, colCcy).Value))
+            ' Konwersja na liczbę w razie gdyby Excel widział kwotę jako tekst
+            amt = Val(Replace(wsIPR.Cells(i, colAmt).Value, ",", ".")) 
+            
+            Select Case ccy
+                Case "USD": sumUSD = sumUSD + amt
+                Case "EUR": sumEUR = sumEUR + amt
+                Case "JPY": sumJPY = sumJPY + amt
+            End Select
+        End If
+    Next i
+
+    ' 11. Wprowadzanie wyników i widocznych formuł do arkusza RUN
+    With wsRun
+        ' Wpisywanie sum (jako twarde wartości)
+        .Range("G18").Value = sumUSD
+        .Range("I18").Value = sumUSD
+        .Range("G19").Value = sumEUR
+        .Range("G20").Value = sumJPY
+        
+        ' Kopiowanie komórek przez jawną formułę (H19 = C7, H20 = C8)
+        .Range("H19").Formula = "=C7"
+        .Range("H20").Formula = "=C8"
+        
+        ' Formuły mnożenia (widoczne w pasku formuły)
+        .Range("I19").Formula = "=G19*H19"
+        .Range("I20").Formula = "=G20*H20"
+        
+        ' Formuła sumująca wyniki (I21 = I18 + I19 + I20)
+        .Range("I21").Formula = "=I18+I19+I20"
+    End With
+
+    MsgBox "Proces zakończony sukcesem!", vbInformation, "Sukces"
+
+Cleanup:
+    ' --- PRZYWRÓCENIE USTAWIEŃ EXCELA ---
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.DisplayAlerts = True
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Wystąpił błąd: " & Err.Description, vbCritical, "Błąd"
+    GoTo Cleanup
+End Sub
+
+' --- FUNKCJA POMOCNICZA DO SZUKANIA KOLUMN ---
+Function ZnajdzKolumne(ws As Worksheet, nazwaKolumny As String) As Long
+    Dim rFound As Range
+    ' Szuka dokładnej nazwy w pierwszym wierszu
+    Set rFound = ws.Rows(1).Find(What:=nazwaKolumny, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    
+    If Not rFound Is Nothing Then
+        ZnajdzKolumne = rFound.Column
+    Else
+        Err.Raise Number:=vbObjectError + 1, Description:="Nie znaleziono kolumny: " & nazwaKolumny
+    End If
+End Function
