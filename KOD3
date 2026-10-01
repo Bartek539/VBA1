@@ -1,0 +1,201 @@
+Option Explicit
+
+Sub ProcessFinancialData_Robust()
+    ' --- DEKLARACJE OBIEKTÓW I ZMIENNYCH ---
+    Dim wbThis As Workbook, wbSource As Workbook
+    Dim wsRun As Worksheet, wsWorkings As Worksheet, wsIPR As Worksheet
+    Dim sourceFilePath As String
+    Dim headerCell As Range, fundCodeCol As Range, payeeCol As Range
+    Dim ccyCol As Range, amtCol As Range
+    Dim headerRow As Long, lastRow As Long, i As Long
+    Dim rngToDelete As Range
+    
+    Dim usdSum As Double, eurSum As Double, jpySum As Double
+    Dim rateEur As Double, rateJpy As Double
+    Dim finalI18 As Double, finalI19 As Double, finalI20 As Double, totalI21 As Double
+    
+    ' --- INICJALIZACJA OBSŁUGI BŁĘDÓW I ŚRODOWISKA ---
+    On Error GoTo ErrorHandler
+    Set wbThis = ThisWorkbook
+    
+    ' Weryfikacja obecności arkusza konfiguracyjnego RUN
+    On Error Resume Next
+    Set wsRun = wbThis.Sheets("RUN")
+    On Error GoTo ErrorHandler
+    If wsRun Is Nothing Then
+        MsgBox "KRYTYCZNY BŁĄD: Brak arkusza o nazwie 'RUN' w tym pliku!", vbCritical, "Błąd struktury"
+        Exit Sub
+    End If
+    
+    ' Weryfikacja ścieżki pliku w B2
+    sourceFilePath = Trim(wsRun.Range("B2").Value)
+    If sourceFilePath = "" Or Dir(sourceFilePath) = "" Then
+        MsgBox "Błąd ścieżki pliku źródłowego w komórce B2:" & vbCrLf & sourceFilePath, vbCritical, "Błąd Wejścia/Wyjścia"
+        Exit Sub
+    End If
+    
+    ' Optymalizacja wydajności (zamrożenie GUI Excela na czas operacji)
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    
+    ' --- RESET / TWORZENIE NOWYCH ARKUSZY ROBOCZYCH ---
+    On Error Resume Next
+    wbThis.Sheets("Workings").Delete
+    wbThis.Sheets("IPR").Delete
+    On Error GoTo ErrorHandler
+    
+    Set wsWorkings = wbThis.Sheets.Add(After:=wbThis.Sheets(wbThis.Sheets.Count))
+    wsWorkings.Name = "Workings"
+    
+    Set wsIPR = wbThis.Sheets.Add(After:=wbThis.Sheets(wbThis.Sheets.Count))
+    wsIPR.Name = "IPR"
+    
+    ' --- ETAP 1: OTWARCIE PLIKU ŹRÓDŁOWEGO (Z HASŁEM) I KOPIOWANIE ---
+    Set wbSource = Workbooks.Open(Filename:=sourceFilePath, Password:="ABC12345", ReadOnly:=True)
+    wbSource.Sheets(1).UsedRange.Copy Destination:=wsWorkings.Range("A1")
+    wbSource.Close SaveChanges:=False
+    
+    ' --- ETAP 2: TRANSFORMACJA I DYNAMICZNE USUWANIE BANERA NAGŁÓWKA ---
+    With wsWorkings
+        ' 1. Dynamiczne wyszukanie wiersza, w którym znajduje się kolumna "Fund Code"
+        '    Przeszukujemy cały arkusz pod kątem nagłówka bazowego
+        Set headerCell = .Cells.Find(What:="Fund Code", LookIn:=xlValues, LookAt:=xlPart, MatchCase:=False)
+        
+        If headerCell Is Nothing Then
+            Err.Raise vbObjectError + 1, , "Nie odnaleziono nagłówka 'Fund Code' w pliku wejściowym."
+        End If
+        
+        headerRow = headerCell.Row
+        
+        ' 2. Jeżeli nagłówek jest niżej niż w wierszu 1, usuwamy wszystko powyżej (wiersze 1 do headerRow - 1)
+        If headerRow > 1 Then
+            .Rows("1:" & (headerRow - 1)).Delete Shift:=xlUp
+        End If
+        
+        ' Po usunięciu nagłówek ZAWSZE znajduje się teraz w wierszu 1
+        ' Pobieramy dokładną kolumnę dla "Fund Code"
+        Set fundCodeCol = .Rows(1).Find(What:="Fund Code", LookAt:=xlPart, MatchCase:=False)
+        lastRow = .Cells(.Rows.Count, fundCodeCol.Column).End(xlUp).Row
+        
+        ' 3. Usunięcie wierszy, gdzie Fund Code = 7588 lub 7606
+        If lastRow > 1 Then
+            .UsedRange.AutoFilter Field:=fundCodeCol.Column, Criteria1:="=7588", Operator:=xlOr, Criteria2:="=7606"
+            
+            On Error Resume Next
+            Set rngToDelete = .UsedRange.Offset(1, 0).SpecialCells(xlCellTypeVisible)
+            On Error GoTo ErrorHandler
+            
+            If Not rngToDelete Is Nothing Then
+                rngToDelete.EntireRow.Delete
+            End If
+            .AutoFilterMode = False
+        End If
+        
+        ' 4. Wyszukanie kolumny "Payee" w nowym wierszu 1
+        Set payeeCol = .Rows(1).Find(What:="Payee", LookAt:=xlPart, MatchCase:=False)
+        If payeeCol Is Nothing Then
+            Err.Raise vbObjectError + 2, , "Nie znaleziono kolumny 'Payee' w nagłówkach pliku."
+        End If
+        
+        lastRow = .Cells(.Rows.Count, payeeCol.Column).End(xlUp).Row
+        
+        ' 5. Filtrowanie Payee (zawiera BRIDGE lub ROCK) i kopiowanie do IPR
+        If lastRow > 1 Then
+            .UsedRange.AutoFilter Field:=payeeCol.Column, Criteria1:="=*BRIDGE*", Operator:=xlOr, Criteria2:="=*ROCK*"
+            
+            On Error Resume Next
+            .UsedRange.SpecialCells(xlCellTypeVisible).Copy Destination:=wsIPR.Range("A1")
+            On Error GoTo ErrorHandler
+            
+            .AutoFilterMode = False
+        End If
+    End With
+    
+    ' --- ETAP 3: AGREGACJA DANYCH W ARKUSZU IPR ---
+    With wsIPR
+        Set ccyCol = .Rows(1).Find(What:="Debit Ccy", LookAt:=xlWhole, MatchCase:=False)
+        Set amtCol = .Rows(1).Find(What:="Debit Ccy Amount", LookAt:=xlWhole, MatchCase:=False)
+        
+        If ccyCol Is Nothing Or amtCol Is Nothing Then
+            Err.Raise vbObjectError + 3, , "W arkuszu IPR brak nagłówków 'Debit Ccy' lub 'Debit Ccy Amount'."
+        End If
+        
+        lastRow = .Cells(.Rows.Count, ccyCol.Column).End(xlUp).Row
+        
+        ' Parsowanie kwot w pamięci (zabezpieczenie przed kropkami, spacjami twardymi Chr(160) i tekstem)
+        For i = 2 To lastRow
+            Dim ccyVal As String
+            Dim rawAmt As Variant
+            Dim cleanAmt As Double
+            
+            ccyVal = UCase(Trim(.Cells(i, ccyCol.Column).Value))
+            rawAmt = .Cells(i, amtCol.Column).Value
+            cleanAmt = 0
+            
+            If IsNumeric(rawAmt) Then
+                cleanAmt = CDbl(rawAmt)
+            ElseIf VarType(rawAmt) = vbString Then
+                rawAmt = Replace(rawAmt, Chr(160), "") ' usuwa non-breaking space
+                rawAmt = Replace(rawAmt, " ", "")
+                rawAmt = Replace(rawAmt, ",", ".")
+                If IsNumeric(rawAmt) Then cleanAmt = Val(rawAmt)
+            End If
+            
+            Select Case ccyVal
+                Case "USD": usdSum = usdSum + cleanAmt
+                Case "EUR": eurSum = eurSum + cleanAmt
+                Case "JPY": jpySum = jpySum + cleanAmt
+            End Select
+        Next i
+    End With
+    
+    ' --- ETAP 4: ZAPIS WYNIKÓW I KALKULACJE W RUN ---
+    With wsRun
+        rateEur = IIf(IsNumeric(.Range("C7").Value), CDbl(.Range("C7").Value), 0)
+        rateJpy = IIf(IsNumeric(.Range("C8").Value), CDbl(.Range("C8").Value), 0)
+        
+        finalI18 = usdSum
+        finalI19 = eurSum * rateEur
+        finalI20 = jpySum * rateJpy
+        totalI21 = finalI18 + finalI19 + finalI20
+        
+        ' Wpisanie czystych wartości binarnych .Value2
+        .Range("G18").Value2 = usdSum
+        .Range("I18").Value2 = finalI18
+        
+        .Range("G19").Value2 = eurSum
+        .Range("H19").Value2 = .Range("C7").Value2
+        .Range("I19").Value2 = finalI19
+        
+        .Range("G20").Value2 = jpySum
+        .Range("H20").Value2 = .Range("C8").Value2
+        .Range("I20").Value2 = finalI20
+        
+        .Range("I21").Value2 = totalI21
+        
+        .Range("G18:I21").NumberFormat = "#,##0.00"
+    End With
+    
+    ' --- PRZYWRÓCENIE USTAWIEŃ APLIKACJI ---
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+    
+    ' --- LOG WYKONANIA ---
+    MsgBox "Proces zakończony pomyślnie!" & vbCrLf & vbCrLf & _
+           "Wykryto nagłówki w wierszu źródłowym: " & headerRow & vbCrLf & _
+           "Usunięto wierszy z góry: " & (headerRow - 1) & vbCrLf & vbCrLf & _
+           "Podsumowanie zapisanych kwot (RUN):" & vbCrLf & _
+           "• USD: " & Format(usdSum, "#,##0.00") & vbCrLf & _
+           "• EUR: " & Format(eurSum, "#,##0.00") & " | Przeliczone: " & Format(finalI19, "#,##0.00") & vbCrLf & _
+           "• JPY: " & Format(jpySum, "#,##0.00") & " | Przeliczone: " & Format(finalI20, "#,##0.00") & vbCrLf & _
+           "• SUMA ŁĄCZNA (I21): " & Format(totalI21, "#,##0.00"), vbInformation, "Status Sukcesu"
+    Exit Sub
+
+ErrorHandler:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+    MsgBox "Wystąpił błąd krytyczny:" & vbCrLf & Err.Description, vbCritical, "Błąd Wykonania"
+End Sub
