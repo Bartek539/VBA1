@@ -1,0 +1,152 @@
+Option Explicit
+
+Sub ProcessFinancialData()
+    ' --- DEKLARACJE ZMIENNYCH ---
+    Dim wbThis As Workbook, wbSource As Workbook
+    Dim wsRun As Worksheet, wsWorkings As Worksheet, wsIPR As Worksheet
+    Dim sourceFilePath As String
+    Dim fundCodeCol As Range, payeeCol As Range, ccyCol As Range, amtCol As Range
+    Dim lastRow As Long
+    Dim rngToDelete As Range
+    
+    ' --- OPTYMALIZACJA WYDAJNOŚCI ---
+    ' Wyłączamy odświeżanie ekranu, eventy i automatyczne przeliczanie formuł
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.DisplayAlerts = False ' Ukrywa ostrzeżenia np. przy usuwaniu arkuszy
+    
+    ' --- INICJALIZACJA OBSŁUGI BŁĘDÓW ---
+    On Error GoTo ErrorHandler
+    
+    ' Ustawienie referencji do głównego pliku i arkusza RUN
+    Set wbThis = ThisWorkbook
+    Set wsRun = wbThis.Sheets("RUN")
+    
+    ' Pobranie ścieżki z komórki B2
+    sourceFilePath = wsRun.Range("B2").Value
+    
+    ' Weryfikacja czy plik w ogóle istnieje na dysku (Windows File System)
+    If Dir(sourceFilePath) = "" Then
+        MsgBox "Nie znaleziono pliku pod ścieżką: " & sourceFilePath, vbCritical, "Błąd I/O"
+        GoTo Cleanup
+    End If
+    
+    ' --- PRZYGOTOWANIE ŚRODOWISKA (WORKINGS i IPR) ---
+    ' Ignorujemy błędy na moment, na wypadek gdyby arkusze jeszcze nie istniały
+    On Error Resume Next
+    wbThis.Sheets("Workings").Delete
+    wbThis.Sheets("IPR").Delete
+    On Error GoTo ErrorHandler ' Powrót do twardej obsługi błędów
+    
+    ' Tworzenie czystych arkuszy na końcu skoroszytu
+    Set wsWorkings = wbThis.Sheets.Add(After:=wbThis.Sheets(wbThis.Sheets.Count))
+    wsWorkings.Name = "Workings"
+    
+    Set wsIPR = wbThis.Sheets.Add(After:=wbThis.Sheets(wbThis.Sheets.Count))
+    wsIPR.Name = "IPR"
+    
+    ' --- ETAP 1: EKSTRAKCJA DANYCH ---
+    ' Otwieranie pliku w tle, tylko do odczytu, z podanym hasłem
+    Set wbSource = Workbooks.Open(Filename:=sourceFilePath, Password:="ABC12345", ReadOnly:=True)
+    
+    ' Skopiowanie całego zakresu danych do nowego arkusza Workings
+    wbSource.Sheets(1).UsedRange.Copy Destination:=wsWorkings.Range("A1")
+    
+    ' Zamknięcie pliku źródłowego bez zapisywania zmian (zwalnia lock w Windowsie)
+    wbSource.Close SaveChanges:=False
+    
+    ' --- ETAP 2: TRANSFORMACJA (WORKINGS) ---
+    With wsWorkings
+        ' Usunięcie pierwszych 5 wierszy (shift do góry)
+        .Rows("1:5").Delete
+        
+        ' Dynamiczne wyszukanie kolumny "Fund Code" w pierwszym wierszu nagłówkowym
+        Set fundCodeCol = .Rows(1).Find(What:="Fund Code", LookAt:=xlWhole, MatchCase:=False)
+        If fundCodeCol Is Nothing Then Err.Raise vbObjectError + 1, , "Brak kolumny 'Fund Code'."
+        
+        lastRow = .Cells(.Rows.Count, fundCodeCol.Column).End(xlUp).Row
+        
+        ' Usunięcie wierszy z 7588 oraz 7606 (najszybsza metoda to AutoFilter + SpecialCells)
+        If lastRow > 1 Then
+            .UsedRange.AutoFilter Field:=fundCodeCol.Column, Criteria1:="7588", Operator:=xlOr, Criteria2:="7606"
+            
+            On Error Resume Next
+            ' Zaznaczenie tylko widocznych komórek z pominięciem nagłówka
+            Set rngToDelete = .UsedRange.Offset(1, 0).SpecialCells(xlCellTypeVisible)
+            On Error GoTo ErrorHandler
+            
+            If Not rngToDelete Is Nothing Then rngToDelete.EntireRow.Delete
+            .AutoFilterMode = False ' Reset filtra
+        End If
+        
+        ' Dynamiczne wyszukanie kolumny "Payee"
+        Set payeeCol = .Rows(1).Find(What:="Payee", LookAt:=xlWhole, MatchCase:=False)
+        If payeeCol Is Nothing Then Err.Raise vbObjectError + 2, , "Brak kolumny 'Payee'."
+        
+        lastRow = .Cells(.Rows.Count, payeeCol.Column).End(xlUp).Row
+        
+        ' Filtrowanie kolumny Payee (zawiera BRIDGE lub zawiera ROCK)
+        If lastRow > 1 Then
+            .UsedRange.AutoFilter Field:=payeeCol.Column, Criteria1:="=*BRIDGE*", Operator:=xlOr, Criteria2:="=*ROCK*"
+        End If
+        
+        ' Skopiowanie przefiltrowanych, widocznych danych do arkusza IPR
+        .UsedRange.SpecialCells(xlCellTypeVisible).Copy Destination:=wsIPR.Range("A1")
+        
+        ' Czystość - wyłączenie filtru na koniec
+        .AutoFilterMode = False
+    End With
+    
+    ' --- ETAP 3: AGREGACJA (IPR) I RAPORTOWANIE (RUN) ---
+    Dim usdSum As Double, eurSum As Double, jpySum As Double
+    
+    ' Zlokalizowanie kolumn walut i kwot w arkuszu IPR
+    Set ccyCol = wsIPR.Rows(1).Find(What:="Debit Ccy", LookAt:=xlWhole, MatchCase:=False)
+    Set amtCol = wsIPR.Rows(1).Find(What:="Debit Ccy Amount", LookAt:=xlWhole, MatchCase:=False)
+    
+    If ccyCol Is Nothing Or amtCol Is Nothing Then
+        Err.Raise vbObjectError + 3, , "Brak kolumn 'Debit Ccy' lub 'Debit Ccy Amount' w IPR."
+    End If
+    
+    ' Obliczenie sum za pomocą natywnej funkcji SUM.JEŻELI (szybkie i precyzyjne)
+    usdSum = Application.WorksheetFunction.SumIf(wsIPR.Columns(ccyCol.Column), "USD", wsIPR.Columns(amtCol.Column))
+    eurSum = Application.WorksheetFunction.SumIf(wsIPR.Columns(ccyCol.Column), "EUR", wsIPR.Columns(amtCol.Column))
+    jpySum = Application.WorksheetFunction.SumIf(wsIPR.Columns(ccyCol.Column), "JPY", wsIPR.Columns(amtCol.Column))
+    
+    ' Zapis wyników do arkusza RUN z zachowaniem kolejności
+    With wsRun
+        ' Operacje dla USD
+        .Range("G18").Value = usdSum
+        .Range("I18").Value = usdSum ' Taka sama wartość
+        
+        ' Operacje dla EUR
+        .Range("G19").Value = eurSum
+        .Range("H19").Value = .Range("C7").Value
+        .Range("I19").Value = .Range("G19").Value * .Range("H19").Value
+        
+        ' Operacje dla JPY
+        .Range("G20").Value = jpySum
+        .Range("H20").Value = .Range("C8").Value
+        .Range("I20").Value = .Range("G20").Value * .Range("H20").Value
+        
+        ' Suma końcowa do I21
+        .Range("I21").Value = .Range("I18").Value + .Range("I19").Value + .Range("I20").Value
+    End With
+    
+    ' Komunikat o zakończeniu
+    MsgBox "Dane zostały pomyślnie przetworzone!", vbInformation, "Proces Zakończony"
+
+Cleanup:
+    ' --- SPRZĄTANIE (BARDZO WAŻNE W ŚRODOWISKU PRODUKCYJNYM) ---
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.DisplayAlerts = True
+    Exit Sub
+
+ErrorHandler:
+    ' Eleganckie złapanie błędu bez wieszania aplikacji
+    MsgBox "Wystąpił błąd podczas procesu:" & vbCrLf & Err.Description, vbCritical, "Błąd Krytyczny"
+    Resume Cleanup ' Skok do sekcji sprzątania (przywraca ustawienia Excela)
+End Sub
